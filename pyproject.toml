@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "speek"
+version = "0.1.0"
+description = "Local, offline voice command and dictation tool for Ubuntu."
+readme = "README.md"
+requires-python = ">=3.12"
+license = {text = "MIT License"}
+dependencies = [
+    "faster-whisper",
+    "pyaudio",
+    "pynput",
+]
+
+[project.scripts]
+speek = "speek.main:main"
