@@ -1,9 +1,6 @@
 .venv/
 __pycache__/
 *.pyc
-*.pyo
-*.pyd
-.pytest_cache/
-*.egg-info/
-build/
-dist/
+*.wav
+models/
+.DS_Store
