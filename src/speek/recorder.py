@@ -1,102 +1,164 @@
-import pyaudio
+import subprocess
 import wave
 import threading
 import logging
+import queue
+import numpy as np
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+
 class AudioRecorder:
-    def __init__(self, sample_rate=16000, max_seconds=120):
+    def __init__(self, sample_rate=16000):
         self.sample_rate = sample_rate
-        self.max_seconds = max_seconds
         self.chunk_size = 1024
         self.channels = 1
-        self.format = pyaudio.paInt16
 
-        self._pa = pyaudio.PyAudio()
-        self._stream = None
+        # VOX Configuration
+        self.silence_threshold = 500  # Amplitude threshold.
+        self.silence_limit_sec = 1.0  # How long you must pause before we slice
+        self.min_chunk_seconds = 2.0  # Don't slice files smaller than 2 seconds
+        self.max_chunk_seconds = 15.0 # Hard limit
+
+        self._parec_proc = None
         self._thread = None
         self._is_recording = False
-        self._output_path = None
-        self._output_path = None
+        self._output_dir = None
+        self._queue = None
 
-    def start(self, output_path: Path, on_timeout=None) -> bool:
-        """Starts recording audio, streaming directly to the disk"""
+    def _get_hardware_mic(self):
+        """Scans PipeWire/PulseAudio to find a physical microphone, bypassing misconfigured default settings"""
+        import subprocess
+        try:
+            # 1. Check if the default source is already a hardware microphone
+            default_source = subprocess.check_output(["pactl", "get-default-source"], text=True).strip()
+            if not default_source.endswith(".monitor"):
+                return default_source
+                
+            # 2. If default is a Monitor, scan the system for a real physical ALSA microphone
+            sources = subprocess.check_output(["pactl", "list", "sources", "short"], text=True)
+            for line in sources.splitlines():
+                parts = line.split()
+                if len(parts) >= 2:
+                    source_name = parts[1]
+                    if not source_name.endswith(".monitor") and "input" in source_name.lower():
+                        return source_name
+        except Exception:
+            pass
+        return None
+
+    def start(self, output_dir: Path, audio_queue: queue.Queue, source_mode: str = "mic") -> bool:
         if self._is_recording:
-            logger.warning("Already recording")
             return False
 
-        self._output_path = output_path
-        self.on_timeout = on_timeout
+        self._output_dir = output_dir
+        self._queue = audio_queue
         self._is_recording = True
 
-        self._stream = self._pa.open(
-            format=self.format,
-            channels=self.channels,
-            rate=self.sample_rate,
-            input=True,
-            frames_per_buffer=self.chunk_size
-        )
+        try:
+            # Universal Linux Audio pipeline via parec!
+            cmd = ["parec", "--format=s16le", "--rate=16000", "--channels=1"]
+            
+            import subprocess
+            if source_mode == "desktop":
+                sink = subprocess.check_output(["pactl", "get-default-sink"], text=True).strip()
+                monitor = f"{sink}.monitor"
+                cmd.extend(["-d", monitor])
+                logger.info(f"Spawning parec for Desktop Monitor: {monitor}")
+            else:
+                # Force Hardware Microphone explicitly!
+                mic_source = self._get_hardware_mic()
+                if mic_source:
+                    cmd.extend(["-d", mic_source])
+                    logger.info(f"Spawning parec for Hardware Microphone: {mic_source}")
+                else:
+                    logger.info("Spawning parec for Default Source (No hardware mic found).")
+                
+            self._parec_proc = subprocess.Popen(cmd, stdout=subprocess.PIPE)
+        except Exception as e:
+            logger.error(f"Failed to spawn parec: {e}")
+            self._is_recording = False
+            return False
 
         self._thread = threading.Thread(target=self._record_loop, daemon=True)
         self._thread.start()
         return True
 
-    def stop(self) -> Path:
-        """Stops recording and releases the stream."""
+    def stop(self):
         self._is_recording = False
+
+        # 1. Terminate streams FIRST to unblock the thread's read() calls!
+        if self._parec_proc:
+            self._parec_proc.terminate()
+
+        # 2. NOW safely wait for the unblocked thread to exit
         if self._thread:
             self._thread.join()
+            self._thread = None
 
-        if self._stream:
-            self._stream.stop_stream()
-            self._stream.close()
-            self._stream = None
-
-        return self._output_path
+        # 3. Final hardware cleanup
+        if self._parec_proc:
+            self._parec_proc.wait()
+            self._parec_proc = None
 
     def _record_loop(self):
-        """
-        TODO: Implement the bounded disk-streaming loop.
+        chunk_index = 0
+        chunk_duration_sec = self.chunk_size / self.sample_rate
+        
+        import time
+        session_id = int(time.time() * 1000)
 
-        1 Open self._output_path as a wave file ('wb').
-        2 Set wave params: nchannels(self.channels),
-        sampwidth(self._pa.get_sample_size(self.format)), framerate(self.sample_rate),
-        3 Create a while loop that runs as long as self._is_recording is True.
-        4 Inside the loop:
-            a. Read `self.chunk_size` from `self._stream` using `exception_on_overflow=False`.
-            b. Write the raw bytes to the wave file.
-            c. Calculate total frames written. If (total_frames/self.sample_rate) >= self.max_seconds:
-                set self._is_recording = False and break
-        5 Outside the loop, make sure the wave file is closed!
-        :return:
-        """
-        with wave.open(str(self._output_path), 'wb') as wf:
+        while self._is_recording:
+            chunk_path = self._output_dir / f"speek_chunk_{session_id}_{chunk_index}.wav"
 
-            # Set wave params
-            wf.setnchannels(self.channels)
-            wf.setsampwidth(self._pa.get_sample_size(self.format))
-            wf.setframerate(self.sample_rate)
+            with wave.open(str(chunk_path), 'wb') as wf:
+                wf.setnchannels(self.channels)
+                # 16-bit PCM Audio is exactly 2 bytes per sample.
+                wf.setsampwidth(2)
+                wf.setframerate(self.sample_rate)
 
-            total_frames = 0
+                frames_written = 0
+                silent_chunks = 0
 
-            # while loop recording is True
-            while self._is_recording:
-                # Read chunk from the mic
-                data = self._stream.read(self.chunk_size, exception_on_overflow=False)
+                # Run until the hard max limit is reached, or stopped early
+                while self._is_recording and frames_written < (self.max_chunk_seconds * self.sample_rate):
+                    try:
+                        if self._parec_proc:
+                            data = self._parec_proc.stdout.read(self.chunk_size * 2)
+                        else:
+                            break
+                            
+                        if not data:
+                            continue
 
-                # Write the raw bytes to disk
-                wf.writeframes(data)
+                        wf.writeframes(data)
+                        frames_written += self.chunk_size
 
-                # Enforce the time limit
-                total_frames += self.chunk_size
-                if (total_frames/self.sample_rate) >= self.max_seconds:
-                    logger.warning("Max recording time reached. Auto-stopping")
-                    self._is_recording = False
-                    break
+                        # Calculate acoustic energy (Volume)
+                        audio_array = np.frombuffer(data, dtype=np.int16).astype(np.float32)
+                        rms_volume = np.sqrt(np.mean(np.square(audio_array)))
 
+                        if rms_volume < self.silence_threshold:
+                            silent_chunks += 1
+                        else:
+                            silent_chunks = 0  # Reset silence counter if you make noise
 
-            if getattr(self, 'on_timeout', None) and (total_frames/self.sample_rate) >= self.max_seconds:
-                logger.info("Max recording time reached. Auto-stopping")
-                threading.Thread(target=self.on_timeout, daemon=True).start()
+                        # Calculate current time states
+                        current_duration = frames_written / self.sample_rate
+                        silence_duration = silent_chunks * chunk_duration_sec
+
+                        # Trigger dynamic slice if we hit our silence parameters
+                        if silence_duration >= self.silence_limit_sec and current_duration >= self.min_chunk_seconds:
+                            logger.info(f"Silence detected. Slicing chunk early at {current_duration:.1f}s.")
+                            break
+
+                    except Exception as e:
+                        logger.error(f"Error reading audio stream: {e}")
+                        break
+
+            # Send finished chunk to the AI Queue
+            if frames_written > 0:
+                self._queue.put(chunk_path)
+
+            chunk_index += 1

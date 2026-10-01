@@ -1,90 +1,126 @@
 import sys
 import logging
 import threading
+import queue
 from pathlib import Path
 from evdev import ecodes
+from PyQt6.QtWidgets import QApplication
 
 from speek.state import StateMachine, AppState
 from speek.recorder import AudioRecorder
 from speek.stt import STTEngine
 from speek.output import get_handler
 from speek.hotkey import EvdevHotkeyListener
+from speek.gui import SpeekWindow, BackendSignals
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
+
 def main():
-    logger.info("Initializing Speek Voice Terminal...")
+    logger.info("Initializing Speek Desktop Application...")
+
+    # 1. Initialize the GUI Application BEFORE anything else
+    app = QApplication(sys.argv)
+    app.setQuitOnLastWindowClosed(False) # Prevent the daemon from dying when window hides
+    signals = BackendSignals()
+    window = SpeekWindow(signals)
+
+    # Start hidden in the background, waiting for the hotkey
+    window.hide()
 
     state_machine = StateMachine()
-    recorder = AudioRecorder(max_seconds=120)
-    ## Change device to "cuda" for GPU, "cpu" for CPU
+    recorder = AudioRecorder()
     stt = STTEngine(model_size="small", device="cuda")
     output_handler = get_handler("type")
 
-    audio_path = Path("/tmp/speek_audio.wav")
+    audio_queue = queue.Queue()
+    output_dir = Path("/tmp")
 
-    def process_audio():
-        """Background thread to handle heavy ML inference and output"""
+    # Garbage Collect any orphaned chunks from previous fatal crashes or hard terminations
+    for old_chunk in output_dir.glob("speek_chunk_*.wav"):
         try:
-            logger.info("Transcribing...")
-            text = stt.transcribe(audio_path)
-            logger.info(f"Recognized: {text}")
+            old_chunk.unlink()
+        except OSError:
+            pass
 
-            if text:
-                # 1. Lock state to BUSY while executing
-                state_machine.transition(AppState.TRANSCRIBING, AppState.BUSY)
-                output_handler.handle(text)
+    # Dynamic Live-Swapping for the UI Button
+    def on_ui_source_toggled(checked):
+        # If the user clicks the button WHILE the app is already recording, hot-swap the hardware stream!
+        if getattr(recorder, "_is_recording", False):
+            logger.info("Live hot-swapping audio source!")
+            recorder.stop()
+            new_mode = "mic" if checked else "desktop"
+            recorder.start(output_dir, audio_queue, source_mode=new_mode)
 
-        except Exception as e:
-            logger.error(f"Error processing: {e}")
-        finally:
-            state_machine.force_reset()
-            logger.info("Resetting state machine... Ready for next input.")
+    window.btn_source.toggled.connect(on_ui_source_toggled)
+
+    def transcription_worker():
+        """Permanent background thread that eats chunks from the Queue"""
+        logger.info("AI Consumer Thread started. Waiting for chunks...")
+        while True:
+            chunk_path = audio_queue.get()
+
+            try:
+                # 1. Thread-safe check of the GUI state
+                current_task = "translate" if window.is_translate_enabled else "transcribe"
+                
+                # 2. Transcribe or Translate the audio chunk
+                text = stt.transcribe(chunk_path, task=current_task)
+
+                if text:
+                    logger.info(f"Recognized: {text}")
+                    # Safely securely send text to the GUI Thread via our Signal
+                    signals.new_transcription.emit(text)
+
+                    # Check thread-safe Machine Gun state
+                    if window.is_machine_gun_enabled:
+                        output_handler.handle(text)
+
+            except Exception as e:
+                logger.error(f"Error processing chunk {chunk_path}: {e}")
+            finally:
+                audio_queue.task_done()
+                if chunk_path.exists():
+                    chunk_path.unlink()
+
+    # Spawn the permanent consumer thread
+    consumer_thread = threading.Thread(target=transcription_worker, daemon=True)
+    consumer_thread.start()
 
     def on_toggle():
-        """
-        TODO (Driver): Implement the atomic State Machine transitions!
-
-        1. Try to transition from IDLE -> RECORDING.
-           If True: Call `recorder.start(audio_path)` and return.
-
-        2. Try to transition from RECORDING -> TRANSCRIBING.
-           If True: Call `recorder.stop()`. Then spawn a `threading.Thread` targeting
-           `process_audio` and `start()` it. Return.
-
-        3. If neither transition succeeds, it means the system is BUSY or in an invalid state.
-           Just log a warning and do nothing!
-        :return:
-        """
+        """Handles the Hotkey logic for the Microphone and GUI Visibility"""
         if state_machine.transition(AppState.IDLE, AppState.RECORDING):
-            recorder.start(audio_path, on_timeout=on_toggle)
+            logger.info("Microphone HOT.")
+            signals.show_window.emit()  # Safely trigger GUI show from main thread
+            
+            source_mode = "mic" if window.is_mic_enabled else "desktop"
+            recorder.start(output_dir, audio_queue, source_mode=source_mode)
             return
 
-        if state_machine.transition(AppState.RECORDING, AppState.TRANSCRIBING):
+        if state_machine.transition(AppState.RECORDING, AppState.IDLE):
+            logger.info("Microphone COLD.")
             recorder.stop()
-            threading.Thread(target=process_audio).start()
+            signals.hide_window.emit()  # Safely trigger GUI hide from main thread
             return
 
         logger.warning("Invalid state transition!")
 
-
     target_keys = [ecodes.KEY_LEFTCTRL, ecodes.KEY_LEFTALT, ecodes.KEY_V]
     listener = EvdevHotkeyListener(target_keys, on_toggle)
-
-    logger.info("Starting hardware listener... Press Ctrl+Alt+V to toggle.")
     listener.start()
 
+    logger.info("Speek is ready. Press Ctrl+Alt+V to begin.")
+
+    # 2. Hand over the Main Thread to the PyQt Event Loop!
     try:
-        # Keep main thread alive
-        import time
-        while True:
-            time.sleep(1)
+        sys.exit(app.exec())
     except KeyboardInterrupt:
         logger.info("Exiting...")
         recorder.stop()
         listener.stop()
         sys.exit(0)
+
 
 if __name__ == "__main__":
     main()

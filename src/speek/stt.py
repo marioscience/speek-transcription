@@ -25,23 +25,14 @@ class STTEngine:
 
         logger.info(f"Whisper model loaded on device '{self.active_device}'.")
 
-    def transcribe(self, audio_path: Path):
+    def transcribe(self, audio_path: Path, task: str = "transcribe"):
         """
-        Transcribes the audio file and returns the text.
-
-        TODO:
-        1 Call self.model.transcribe(str(audio_path), beam_size=5, ...)
-        2 You MUST pass: vad_filter=True
-        3 You MUST pass: vad_parameters=dict(min_silence_duration_ms=500)
-        4 The transcribe method returns `segments` (a generator) and `info`
-        5 Iterate through the `segments` generator, extract the `.text` property of each,
-        join them with a space, and return the stripped string
-        :param audio_path:
-        :return:
+        Transcribes or translates the audio file and returns the text.
         """
         segments, _ = self.model.transcribe(
             str(audio_path),
             beam_size=5,
+            task=task,
             vad_filter=True,
             vad_parameters=dict(min_silence_duration_ms=500)
         )
