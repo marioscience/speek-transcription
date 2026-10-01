@@ -1,9 +1,9 @@
 import sys
 from pathlib import Path
 from PyQt6.QtWidgets import (QApplication, QWidget, QHBoxLayout, QVBoxLayout,
-                             QPushButton, QScrollArea, QLabel, QFrame, QMenu)
+                             QPushButton, QScrollArea, QLabel, QFrame, QMenu, QWidgetAction)
 from PyQt6.QtCore import Qt, pyqtSignal, QObject, QTimer, QVariantAnimation
-from PyQt6.QtGui import QColor
+from PyQt6.QtGui import QColor, QAction
 
 class BackendSignals(QObject):
     """Secure bridge between the background AI and the Main GUI Thread"""
@@ -113,6 +113,54 @@ class SpeekWindow(QWidget):
         
         control_layout = QVBoxLayout()
         control_layout.setContentsMargins(4, 0, 0, 0)
+        
+        # 1. Hamburger Menu Setup
+        self.main_menu = QMenu(self)
+        self.main_menu.setStyleSheet("QMenu { background-color: #2d2d2d; color: #fff; border: 1px solid #555; } QMenu::item:selected { background-color: #444; }")
+
+        # 2. Custom Font Size Widget Action
+        font_action = QWidgetAction(self)
+        font_widget = QWidget()
+        font_layout = QHBoxLayout(font_widget)
+        font_layout.setContentsMargins(5, 2, 5, 2)
+        
+        btn_font_dec = QPushButton("-")
+        btn_font_dec.setFixedSize(24, 24)
+        btn_font_dec.clicked.connect(lambda: self.change_font(-2))
+        
+        lbl_font = QLabel("Font Size")
+        lbl_font.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lbl_font.setStyleSheet("background: transparent; border: none; font-size: 12px;")
+        
+        btn_font_inc = QPushButton("+")
+        btn_font_inc.setFixedSize(24, 24)
+        btn_font_inc.clicked.connect(lambda: self.change_font(2))
+        
+        font_layout.addWidget(btn_font_dec)
+        font_layout.addWidget(lbl_font)
+        font_layout.addWidget(btn_font_inc)
+        font_action.setDefaultWidget(font_widget)
+        
+        self.main_menu.addAction(font_action)
+        self.main_menu.addSeparator()
+
+        # 3. Future Options Placeholder
+        target_lang = QAction("Target Language [Future]", self)
+        target_lang.setEnabled(False)
+        self.main_menu.addAction(target_lang)
+        
+        model_size = QAction("Model Size [Future]", self)
+        model_size.setEnabled(False)
+        self.main_menu.addAction(model_size)
+
+        typing_mode = QAction("Typing Mode [Future]", self)
+        typing_mode.setEnabled(False)
+        self.main_menu.addAction(typing_mode)
+
+        # 4. Bind the Menu to the Hamburger Button
+        self.btn_menu = QPushButton("☰ Menu")
+        self.btn_menu.setMenu(self.main_menu)
+        control_layout.addWidget(self.btn_menu)
         
         self.btn_pin = QPushButton("📌 Pin")
         self.btn_pin.setCheckable(True)
